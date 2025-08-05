@@ -3,7 +3,7 @@
 #include <Adafruit_Sensor.h>
 
 Adafruit_MPU6050 mpu;
-
+//with fall deteddction 
 // Thresholds (g, °/s, ms)
 const float  FREEFALL_G       = 0.75;
 const float  GYRO_FALL_DEG_S  = 100;
