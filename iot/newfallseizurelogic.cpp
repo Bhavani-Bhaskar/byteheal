@@ -3,6 +3,11 @@
 #include <Adafruit_Sensor.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>  // Add this with other includes
+
+// Telegram config (add with other constants)
+const String BOT_TOKEN = "8264191106:AAEGIsLmFY3ZfPjU_uakh0eqAHMrG7JL0p4";  // From @BotFather
+const String CHAT_ID = "7778326919";      // Get from /getUpdates
 
 // WiFi credentials
 const char* ssid = "OnePlus Nord CE3 5G";
@@ -18,7 +23,7 @@ const float GYRO_FALL_DEG_S = 100;     // Gyro threshold for fall confirmation
 const float SEIZURE_RMS_THR = 80;      // Seizure detection threshold (RMS)
 const unsigned long DEBOUNCE_MS = 100; // Debounce time for fall detection
 const unsigned long SAMPLE_DELAY_MS = 100; // Sampling interval (100ms)
-const unsigned long SEIZURE_TIMEOUT_MS = 7000; // 7 seconds auto-reset
+const unsigned long SEIZURE_ALERT_MS = 13000; // 7 seconds for severe alert
 
 // Buffers and status variables
 float gyroBuffer[100];
@@ -27,8 +32,9 @@ bool inFreefall = false;
 unsigned long freefallStart = 0;
 unsigned long seizureStart = 0;
 int fallFlag = 0;      // Manual reset only
-int seizureFlag = 0;   // Auto-reset after 7 seconds or manual reset
+int seizureFlag = 0;   // 1 = detected (yellow, auto-reset), 2 = severe (red, manual reset)
 bool mpuConnected = false;
+bool wasSeizureDetected = false; // Track if we're in a seizure condition
 
 void setup() {
   Serial.begin(115200);
@@ -42,7 +48,7 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/data", handleData);
   server.on("/resetFall", []() { fallFlag = 0; server.send(200, "text/plain", "OK"); });
-  server.on("/resetSeizure", []() { seizureFlag = 0; seizureStart = 0; server.send(200, "text/plain", "OK"); });
+  server.on("/resetSeizure", []() { seizureFlag = 0; seizureStart = 0; wasSeizureDetected = false; server.send(200, "text/plain", "OK"); });
   server.onNotFound(handleNotFound);
   server.enableCORS(true);
   server.begin();
@@ -50,13 +56,32 @@ void setup() {
 
 void loop() {
   server.handleClient();  // Handle client requests
-  
-  // Check if seizure flag should auto-reset after 7 seconds
-  if (seizureFlag && (millis() - seizureStart >= SEIZURE_TIMEOUT_MS)) {
-    seizureFlag = 0;
-    seizureStart = 0;
+  static int prevFallFlag = 0;
+  static int prevSeizureFlag = 0;
+
+// Trigger alerts on state changes
+  if (fallFlag == 1 && prevFallFlag == 0) {
+    sendTelegramAlert("🚨 FALL DETECTED! Check patient immediately!");
   }
-  
+  if (seizureFlag == 2 && prevSeizureFlag != 2) {
+    sendTelegramAlert("⚠️ SEVERE SEIZURE (13s+ detected)! Emergency!");
+  }
+
+  prevFallFlag = fallFlag;
+  prevSeizureFlag = seizureFlag;
+  // Handle seizure flag state
+  if (seizureFlag == 1) {
+    // Check if seizure condition is still active
+    if (!wasSeizureDetected) {
+      // If seizure condition ended before 7 seconds, auto-reset
+      seizureFlag = 0;
+      seizureStart = 0;
+    } 
+    else if (millis() - seizureStart >= SEIZURE_ALERT_MS) {
+      // If seizure continues for 7+ seconds, upgrade to type 2
+      seizureFlag = 2;
+    }
+  }
   // Only read sensor if MPU is connected
   if (mpuConnected) {
     if (!readSensorData()) {
@@ -66,6 +91,142 @@ void loop() {
     }
   }
   delay(SAMPLE_DELAY_MS);
+}
+
+bool readSensorData() {
+  sensors_event_t accel, gyro;
+  if (!mpu.getAccelerometerSensor()->getEvent(&accel) || !mpu.getGyroSensor()->getEvent(&gyro)) 
+    return false;
+
+  // Fall detection (unchanged)
+  float ax = accel.acceleration.x / 9.80665;
+  float ay = accel.acceleration.y / 9.80665;
+  float az = accel.acceleration.z / 9.80665;
+  float amag = sqrt(ax*ax + ay*ay + az*az);
+
+  if (amag < FREEFALL_G) {
+    if (!inFreefall) {
+      inFreefall = true;
+      freefallStart = millis();
+    } 
+    else if ((millis() - freefallStart >= DEBOUNCE_MS) && 
+             (abs(gyro.gyro.x*57.2958) > GYRO_FALL_DEG_S || 
+              abs(gyro.gyro.y*57.2958) > GYRO_FALL_DEG_S || 
+              abs(gyro.gyro.z*57.2958) > GYRO_FALL_DEG_S)) {
+      fallFlag = 1;
+    }
+  } else {
+    inFreefall = false;
+  }
+
+  // Seizure detection
+  float wmag = sqrt(pow(gyro.gyro.x*57.2958, 2) + pow(gyro.gyro.y*57.2958, 2) + pow(gyro.gyro.z*57.2958, 2));
+  gyroBuffer[bufIndex++] = wmag;
+  
+  if (bufIndex >= 100) {
+    bufIndex = 0;
+    float sumSq = 0;
+    for (int i=0; i<100; i++) sumSq += gyroBuffer[i] * gyroBuffer[i];
+    float rms = sqrt(sumSq/100);
+    
+    wasSeizureDetected = (rms > SEIZURE_RMS_THR);
+    
+    if (wasSeizureDetected) {
+      if (seizureFlag == 0) {
+        // New seizure detected
+        seizureFlag = 1;
+        seizureStart = millis();
+      }
+    } else if (seizureFlag == 1) {
+      // Seizure condition ended before reaching 7 seconds
+      // Let the loop() handle the auto-reset
+    }
+  }
+
+  Serial.printf("Fall: %d | Seizure: %d\n", fallFlag, seizureFlag);
+  return true;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", 
+  R"=====(
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <title>ESP32 Fall/Seizure Detector</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
+      .flag { font-size: 2em; font-weight: bold; margin: 10px; }
+      .status { padding: 15px; border-radius: 10px; margin: 20px; }
+      .normal { background-color: #d4edda; color: #155724; }
+      .warning { background-color: #fff3cd; color: #856404; }
+      .alert { background-color: #f8d7da; color: #721c24; }
+      button { 
+        background-color: #dc3545; color: white; border: none; 
+        padding: 10px 20px; border-radius: 5px; cursor: pointer;
+        margin-top: 10px; font-size: 1em;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ESP32 Health Monitor</h1>
+    
+    <div id="fallStatus" class="status normal">
+      <h2>Fall Detection</h2>
+      <p class="flag" id="fallFlag">0</p>
+      <button id="resetFallButton" style="display:none;">Reset Fall Alert</button>
+    </div>
+    
+    <div id="seizureStatus" class="status normal">
+      <h2>Seizure Detection</h2>
+      <p class="flag" id="seizureFlag">0</p>
+      <button id="resetSeizureButton" style="display:none;">Reset Severe Seizure</button>
+    </div>
+    
+    <script>
+      function getStatusClass(flagValue) {
+        if (flagValue == 2) return 'alert';
+        if (flagValue == 1) return 'warning';
+        return 'normal';
+      }
+      
+      function updateData() {
+        fetch('/data')
+          .then(r => r.json())
+          .then(data => {
+            document.getElementById('fallFlag').textContent = data.fallFlag;
+            document.getElementById('seizureFlag').textContent = data.seizureFlag;
+            
+            // Update UI
+            document.getElementById('fallStatus').className = 
+              `status ${data.fallFlag ? 'alert' : 'normal'}`;
+            document.getElementById('seizureStatus').className = 
+              `status ${getStatusClass(data.seizureFlag)}`;
+              
+            // Show/hide buttons
+            document.getElementById('resetFallButton').style.display = 
+              data.fallFlag ? 'inline-block' : 'none';
+            document.getElementById('resetSeizureButton').style.display = 
+              data.seizureFlag == 2 ? 'inline-block' : 'none';
+          });
+      }
+      
+      // Button handlers
+      document.getElementById('resetFallButton').addEventListener('click', () => {
+        fetch('/resetFall').then(updateData);
+      });
+      document.getElementById('resetSeizureButton').addEventListener('click', () => {
+        fetch('/resetSeizure').then(updateData);
+      });
+      
+      // Update every second
+      setInterval(updateData, 1000);
+      updateData();
+    </script>
+  </body>
+  </html>
+  )=====");
 }
 
 bool initializeMPU() {
@@ -107,125 +268,27 @@ void connectToWiFi() {
   }
 }
 
-bool readSensorData() {
-  sensors_event_t accel, gyro;
-  if (!mpu.getAccelerometerSensor()->getEvent(&accel) || !mpu.getGyroSensor()->getEvent(&gyro)) 
-    return false;
-
-  // Fall detection
-  float ax = accel.acceleration.x / 9.80665;
-  float ay = accel.acceleration.y / 9.80665;
-  float az = accel.acceleration.z / 9.80665;
-  float amag = sqrt(ax*ax + ay*ay + az*az);
-
-  if (amag < FREEFALL_G) {
-    if (!inFreefall) {
-      inFreefall = true;
-      freefallStart = millis();
-    } 
-    else if ((millis() - freefallStart >= DEBOUNCE_MS) && 
-             (abs(gyro.gyro.x*57.2958) > GYRO_FALL_DEG_S || 
-              abs(gyro.gyro.y*57.2958) > GYRO_FALL_DEG_S || 
-              abs(gyro.gyro.z*57.2958) > GYRO_FALL_DEG_S)) {
-      fallFlag = 1;  // Stays on until manual reset
+void sendTelegramAlert(String message) {
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi not connected - Telegram alert skipped");
+      return;
     }
-  } else {
-    inFreefall = false;
-  }
-
-  // Seizure detection
-  float wmag = sqrt(pow(gyro.gyro.x*57.2958, 2) + pow(gyro.gyro.y*57.2958, 2) + pow(gyro.gyro.z*57.2958, 2));
-  gyroBuffer[bufIndex++] = wmag;
-  if (bufIndex >= 100) {
-    bufIndex = 0;
-    float sumSq = 0;
-    for (int i=0; i<100; i++) sumSq += gyroBuffer[i] * gyroBuffer[i];
-    if (sqrt(sumSq/100) > SEIZURE_RMS_THR) {
-      seizureFlag = 1;
-      if (seizureStart == 0) {
-        seizureStart = millis(); // Start timer when seizure is first detected
-      }
+  
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage";
+    String payload = "chat_id=" + CHAT_ID + "&text=" + message + "&disable_notification=false";
+  
+    http.begin(url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    
+    int httpCode = http.POST(payload);
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println("Telegram alert sent");
+    } else {
+      Serial.printf("Telegram failed: %d\n", httpCode);
     }
+    http.end();
   }
-
-  Serial.printf("Fall: %d | Seizure: %d\n", fallFlag, seizureFlag);
-  return true;
-}
-
-void handleRoot() {
-  server.send(200, "text/html", 
-  R"=====(
-  <!DOCTYPE html>
-  <html>
-  <head>
-    <title>ESP32 Fall/Seizure Detector</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <style>
-      body { font-family: Arial, sans-serif; text-align: center; margin: 20px; }
-      .flag { font-size: 2em; font-weight: bold; margin: 10px; }
-      .status { padding: 15px; border-radius: 10px; margin: 20px; }
-      .normal { background-color: #d4edda; color: #155724; }
-      .alert { background-color: #f8d7da; color: #721c24; }
-      button { 
-        background-color: #dc3545; color: white; border: none; 
-        padding: 10px 20px; border-radius: 5px; cursor: pointer;
-        margin-top: 10px; font-size: 1em;
-      }
-    </style>
-  </head>
-  <body>
-    <h1>ESP32 Health Monitor</h1>
-    
-    <div id="fallStatus" class="status normal">
-      <h2>Fall Detection</h2>
-      <p class="flag" id="fallFlag">0</p>
-      <button id="resetFallButton" style="display:none;">Reset Fall Alert</button>
-    </div>
-    
-    <div id="seizureStatus" class="status normal">
-      <h2>Seizure Detection</h2>
-      <p class="flag" id="seizureFlag">0</p>
-      <button id="resetSeizureButton" style="display:none;">Reset Seizure Alert</button>
-    </div>
-    
-    <script>
-      function updateData() {
-        fetch('/data')
-          .then(r => r.json())
-          .then(data => {
-            document.getElementById('fallFlag').textContent = data.fallFlag;
-            document.getElementById('seizureFlag').textContent = data.seizureFlag;
-            
-            // Update UI
-            document.getElementById('fallStatus').className = 
-              `status ${data.fallFlag ? 'alert' : 'normal'}`;
-            document.getElementById('seizureStatus').className = 
-              `status ${data.seizureFlag ? 'alert' : 'normal'}`;
-              
-            // Show/hide buttons
-            document.getElementById('resetFallButton').style.display = 
-              data.fallFlag ? 'inline-block' : 'none';
-            document.getElementById('resetSeizureButton').style.display = 
-              data.seizureFlag ? 'inline-block' : 'none';
-          });
-      }
-      
-      // Button handlers
-      document.getElementById('resetFallButton').addEventListener('click', () => {
-        fetch('/resetFall').then(updateData);
-      });
-      document.getElementById('resetSeizureButton').addEventListener('click', () => {
-        fetch('/resetSeizure').then(updateData);
-      });
-      
-      // Update every second
-      setInterval(updateData, 1000);
-      updateData();
-    </script>
-  </body>
-  </html>
-  )=====");
-}
 
 void handleData() {
   String json = String("{\"fallFlag\":") + fallFlag + ",\"seizureFlag\":" + seizureFlag + "}";
